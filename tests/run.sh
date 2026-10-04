@@ -54,6 +54,7 @@ setup() {
   export RTSP_LO="rtsp://stub/stream2" RTSP_HI="rtsp://stub/stream1"
   unset GATE_CMD STUB_FFMPEG_FAIL STUB_RCLONE_FAIL
   apply_defaults
+  RING_WAIT_SECS=0
   mkdir -p "$CLIPS" "$HELD" "$RING"
   log() { echo "$*" >> "$T/log"; }   # quiet logger for tests
 }
@@ -171,6 +172,112 @@ test_flush_pending_uploads_clips_dir() {
   echo x > "$CLIPS/old.mp4"
   flush_pending
   assert_contains "$(<"$T/rclone.calls")" "move $CLIPS "
+}
+
+# ---------- unit 2: pre-roll ring buffer ----------
+seg_names() { local e; for e in "$@"; do echo "seg_$e.ts"; done; }
+
+test_select_segments_range() {
+  setup; SEG_SECS=5
+  # [112,128]: seg 110 covers 110-115 (contains 112); 125 covers up to 130
+  local got
+  got=$(seg_names 100 105 110 115 120 125 130 135 | select_segments 112 128 | tr '\n' ' ')
+  assert_eq "seg_110.ts seg_115.ts seg_120.ts seg_125.ts " "$got"
+}
+
+test_select_segments_edges_and_junk() {
+  setup; SEG_SECS=5
+  local got
+  # seg 105 ends exactly at 110 == start -> excluded; seg 130 starts at end -> included
+  got=$( { echo junk.txt; echo seg_abc.ts; seg_names 130 105 110; } | select_segments 110 130 | tr '\n' ' ')
+  assert_eq "seg_110.ts seg_130.ts " "$got" "sorted numerically, junk ignored"
+  got=$(seg_names 90 95 | select_segments 110 130)
+  assert_eq "" "$got" "nothing in range"
+}
+
+test_segments_closed_through() {
+  setup
+  seg_names 120 125 | segments_closed_through 128; assert_rc 1 $? "still writing last seg"
+  seg_names 120 125 130 | segments_closed_through 128; assert_rc 0 $? "a newer seg exists"
+  : | segments_closed_through 128; assert_rc 1 $? "empty ring"
+}
+
+test_ring_coverage_ok() {
+  setup; SEG_SECS=5
+  : | ring_coverage_ok 128; assert_rc 1 $? "empty selection"
+  seg_names 110 115 120 125 | ring_coverage_ok 128; assert_rc 0 $? "reaches the end"
+  seg_names 100 105 | ring_coverage_ok 128; assert_rc 1 $? "segmenter died early"
+}
+
+test_select_prune() {
+  setup; RING_SECS=120
+  local got
+  got=$(seg_names 800 879 880 900 1000 | select_prune 1000 | tr '\n' ' ')
+  assert_eq "seg_800.ts seg_879.ts " "$got" "only older than RING_SECS"
+}
+
+test_prune_ring_deletes_only_old_segments() {
+  setup; RING_SECS=120
+  touch "$RING/seg_100.ts" "$RING/seg_950.ts" "$RING/keep.txt"
+  prune_ring 1000
+  assert_no_file "$RING/seg_100.ts"
+  assert_file "$RING/seg_950.ts"
+  assert_file "$RING/keep.txt"
+}
+
+test_segmenter_command_line() {
+  setup; SEG_SECS=7
+  local args; args=" $(segmenter_cmd_args | tr '\n' ' ')"
+  local want
+  for want in " -nostdin " " -fflags +genpts " " -i rtsp://stub/stream1 " " -c:v copy " \
+              " -c:a aac " " -f segment " " -segment_time 7 " " -reset_timestamps 1 " \
+              " -strftime 1 " "/seg_%s.ts"; do
+    assert_contains "$args" "$want"
+  done
+  # genpts must be an INPUT option (before -i)
+  [[ "${args%%-fflags*}" != *" -i "* ]] || fail "-fflags +genpts after -i"
+}
+
+test_segmenter_is_supervised() {
+  setup
+  ( n=0; sleep() { n=$((n + 1)); ((n >= 3)) && exit 0; }; segmenter_loop </dev/null ) >/dev/null
+  assert_eq 3 "$(wc -l <"$T/ffmpeg.calls" | tr -d ' ')" "segmenter restarted after each exit"
+}
+
+test_clip_built_from_ring_with_preroll() {
+  setup; SEG_SECS=5; PREROLL_SECS=5; CLIP_SECS=10
+  local e; for e in 1690 1695 1700 1705 1710 1715 1720; do touch "$RING/seg_$e.ts"; done
+  capture 1700 >/dev/null
+  # window [1695, 1710]: 1690 ends at 1695 (excluded); 1695..1710 included
+  assert_eq "file '$RING/seg_1695.ts'
+file '$RING/seg_1700.ts'
+file '$RING/seg_1705.ts'
+file '$RING/seg_1710.ts'" "$(<"$T/ffmpeg.concat")" "concat list"
+  local call; call=$(rg 'concat' "$T/ffmpeg.calls")
+  assert_contains "$call" "-nostdin"
+  assert_contains "$call" "-c copy"
+  assert_contains "$call" "-bsf:a aac_adtstoasc"
+  assert_contains "$call" "-movflags +faststart"
+  assert_contains "$call" "mov_"
+  assert_eq 1 "$(wc -l <"$T/ffmpeg.calls" | tr -d ' ')" "no direct recording when the ring is enough"
+  assert_contains "$(<"$T/rclone.calls")" "move $CLIPS/mov_"
+  assert_no_file "$RING/concat_1710_$$.txt"
+}
+
+test_capture_falls_back_to_direct_when_ring_empty() {
+  setup; CLIP_SECS=3
+  capture 1700 >/dev/null
+  local call; call=$(<"$T/ffmpeg.calls")
+  assert_contains "$call" "-i rtsp://stub/stream1"
+  assert_contains "$call" "-t 3"
+  assert_contains "$(<"$T/rclone.calls")" "move $CLIPS/mov_"
+}
+
+test_capture_falls_back_when_segmenter_died_midclip() {
+  setup; SEG_SECS=5; PREROLL_SECS=5; CLIP_SECS=30
+  touch "$RING/seg_1690.ts" "$RING/seg_1695.ts"   # then nothing: segmenter died
+  capture 1700 >/dev/null
+  assert_contains "$(<"$T/ffmpeg.calls")" "-i rtsp://stub/stream1"
 }
 
 # ---------- driver ----------

@@ -6,7 +6,11 @@
 # the file is executed directly.
 
 apply_defaults() {
-  CLIP_SECS=${CLIP_SECS:-30}       # duracion del clip grabado
+  CLIP_SECS=${CLIP_SECS:-30}       # duracion del clip grabado (despues del disparo)
+  PREROLL_SECS=${PREROLL_SECS:-5}  # segundos de pre-roll tomados del ring buffer
+  SEG_SECS=${SEG_SECS:-5}          # duracion nominal de cada segmento del ring
+  RING_SECS=${RING_SECS:-120}      # el pruner borra segmentos mas viejos que esto
+  RING_WAIT_SECS=${RING_WAIT_SECS:-$((SEG_SECS * 3 + 5))}  # espera maxima por el ultimo segmento
   SCENE=${SCENE:-0.005}            # umbral por frame (ruido de fondo: mediana 0.0007)
   DEBOUNCE=${DEBOUNCE:-40}         # segundos minimos entre disparos (reloj de pared)
   RETENTION_DAYS=${RETENTION_DAYS:-60}
@@ -148,18 +152,124 @@ record_direct() {
     -t "$CLIP_SECS" -c:v copy -c:a aac "$1" </dev/null >>"${LOG:-/dev/null}" 2>&1
 }
 
+# --- pre-roll ring buffer ---------------------------------------------------
+# A long-running ffmpeg segments stream1 into seg_<epoch>.ts (mpegts). The
+# camera audio is PCM A-law, which MP4 rejects, hence -c:a aac. On trigger we
+# concat the segments covering [T-PREROLL, T+CLIP] into an mp4 (no re-encode).
+
+ring_list() {
+  local f
+  for f in "$RING"/seg_*.ts; do
+    [[ -e $f ]] && echo "${f##*/}"
+  done
+}
+
+segmenter_cmd_args() {
+  printf '%s\n' ffmpeg -nostdin -loglevel error -fflags +genpts "${IN_OPTS_A[@]}" \
+    -i "$RTSP_HI" -c:v copy -c:a aac -f segment -segment_time "$SEG_SECS" \
+    -reset_timestamps 1 -strftime 1 -segment_format mpegts "$RING/seg_%s.ts"
+}
+
+# select_segments START END: names on stdin -> names covering [START,END],
+# sorted by time. A segment seg_E.ts nominally spans [E, E+SEG_SECS).
+select_segments() {
+  local start=$1 end=$2 n e
+  while IFS= read -r n; do
+    [[ $n =~ ^seg_([0-9]+)\.ts$ ]] || continue
+    e=$((10#${BASH_REMATCH[1]}))
+    if ((e + SEG_SECS > start && e <= end)); then echo "$e $n"; fi
+  done | sort -n | cut -d' ' -f2
+}
+
+# segments_closed_through END: names on stdin; 0 when a segment that starts
+# after END exists, i.e. the one containing END is finished being written.
+segments_closed_through() {
+  local end=$1 n
+  while IFS= read -r n; do
+    [[ $n =~ ^seg_([0-9]+)\.ts$ ]] || continue
+    if ((10#${BASH_REMATCH[1]} > end)); then return 0; fi
+  done
+  return 1
+}
+
+# ring_coverage_ok END: selected names on stdin; fails when the selection is
+# empty or stops long before END (segmenter down).
+ring_coverage_ok() {
+  local end=$1 n last=-1
+  while IFS= read -r n; do
+    [[ $n =~ ^seg_([0-9]+)\.ts$ ]] && last=$((10#${BASH_REMATCH[1]}))
+  done
+  ((last >= 0 && last + 2 * SEG_SECS >= end))
+}
+
+# select_prune NOW: names on stdin -> names older than RING_SECS.
+select_prune() {
+  local now=$1 n
+  while IFS= read -r n; do
+    [[ $n =~ ^seg_([0-9]+)\.ts$ ]] || continue
+    if ((10#${BASH_REMATCH[1]} < now - RING_SECS)); then echo "$n"; fi
+  done
+}
+
+prune_ring() {
+  local n
+  while IFS= read -r n; do rm -f "${RING:?}/$n"; done \
+    < <(ring_list | select_prune "${1:-$(date +%s)}")
+}
+
+segmenter_loop() {
+  local cmd=()
+  while true; do
+    mapfile -t cmd < <(segmenter_cmd_args)
+    "${cmd[@]}" </dev/null >>"${LOG:-/dev/null}" 2>&1
+    log "segmentador cayo — reintento en 15s"
+    sleep 15
+  done
+}
+
+pruner_loop() {
+  while true; do sleep 30; prune_ring; done
+}
+
+# Wait until END is fully segmented (bounded by RING_WAIT_SECS).
+wait_for_ring() {
+  local end=$1 now waited=0
+  now=$(date +%s)
+  if ((end > now)); then sleep $((end - now)); fi
+  while ! ring_list | segments_closed_through "$end"; do
+    if ((waited >= RING_WAIT_SECS)); then return 1; fi
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
+# build_clip_from_ring START END OUT
+build_clip_from_ring() {
+  local start=$1 end=$2 out=$3 sel list n rc
+  wait_for_ring "$end" || log "ring: ultimo segmento incompleto, uso lo disponible"
+  sel=$(ring_list | select_segments "$start" "$end")
+  ring_coverage_ok "$end" <<<"$sel" || return 1
+  list="$RING/concat_${end}_${BASHPID}.txt"
+  while IFS= read -r n; do echo "file '$RING/$n'"; done <<<"$sel" >"$list"
+  ffmpeg -nostdin -y -loglevel error -f concat -safe 0 -i "$list" -c copy \
+    -bsf:a aac_adtstoasc -movflags +faststart "$out" </dev/null >>"${LOG:-/dev/null}" 2>&1
+  rc=$?
+  rm -f "$list"
+  return $rc
+}
+
 # capture T: runs in the background, T = epoch seconds of the trigger.
 capture() {
   local t=${1:-$(date +%s)} ts month name
   printf -v ts '%(%Y-%m-%d_%H-%M-%S)T' "$t"
   printf -v month '%(%Y-%m)T' "$t"
   name="$CLIPS/mov_${ts}.mp4"
-  log "MOVIMIENTO -> grabando ${CLIP_SECS}s"
-  if record_direct "$name"; then
-    upload_clip "$name" "$month"
-  else
-    log "ERROR grabando — descarto"; rm -f "$name"
+  log "MOVIMIENTO -> clip con ${PREROLL_SECS}s de pre-roll + ${CLIP_SECS}s"
+  if ! build_clip_from_ring $((t - PREROLL_SECS)) $((t + CLIP_SECS)) "$name"; then
+    log "ring incompleto — grabacion directa (sin pre-roll)"
+    rm -f "$name"
+    record_direct "$name" || { log "ERROR grabando — descarto"; rm -f "$name"; purge_drive; return; }
   fi
+  upload_clip "$name" "$month"
   purge_drive
 }
 
@@ -233,6 +343,7 @@ main() {
   fi
   apply_defaults
   mkdir -p "$CLIPS" "$HELD" "$RING"
+  rm -f "$RING"/seg_*.ts "$RING"/concat_*.txt
 
   if [ "${1:-}" = "--calibrar" ]; then
     calibrate "${2:-30}"
@@ -242,10 +353,12 @@ main() {
   command -v termux-wake-lock >/dev/null && termux-wake-lock
   trap cleanup INT TERM
 
-  log "=== vigilancia activa | umbral=$SCENE persistencia=${MIN_HITS}hits/${WINDOW}s clip=${CLIP_SECS}s debounce=${DEBOUNCE}s retencion=${RETENTION_DAYS}d ==="
+  log "=== vigilancia activa | umbral=$SCENE persistencia=${MIN_HITS}hits/${WINDOW}s clip=${PREROLL_SECS}s+${CLIP_SECS}s ring=${RING_SECS}s debounce=${DEBOUNCE}s retencion=${RETENTION_DAYS}d ==="
   flush_pending
   purge_drive
 
+  segmenter_loop </dev/null & CHILD_PIDS+=($!)
+  pruner_loop </dev/null & CHILD_PIDS+=($!)
   detector_loop </dev/null & CHILD_PIDS+=($!)
   wait
 }
