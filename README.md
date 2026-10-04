@@ -1,4 +1,17 @@
+<div align="center">
+
+<img src="docs/claude-cam.svg" alt="Pixel-art Claude caught by the security camera, tagged 'claude 0.99' and uploaded" width="720">
+
 # tapo-nvr
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-3DDC84.svg)](LICENSE)
+![Runs on](https://img.shields.io/badge/runs%20on-Android%20%C2%B7%20Termux-D97757.svg)
+![bash](https://img.shields.io/badge/bash-5-4EAA25.svg?logo=gnubash&logoColor=white)
+![Python](https://img.shields.io/badge/python-3-3776AB.svg?logo=python&logoColor=white)
+![ffmpeg](https://img.shields.io/badge/ffmpeg-8-007808.svg?logo=ffmpeg&logoColor=white)
+![YOLO11n](https://img.shields.io/badge/detector-YOLO11n%20ONNX-F2C94C.svg)
+
+</div>
 
 **A tiny, self-hosted NVR for a TP-Link Tapo camera that runs entirely on an Android tablet.**
 It records only what matters (people and vehicles that actually move), keeps a few
@@ -80,6 +93,7 @@ without pre-roll.
 | `termux/daily-summary.py` | Turns the last 24 h of the log into JSON |
 | `apps-script/Code.gs` | Google Apps Script that emails the daily summary |
 | `tests/` | Bash and Python tests |
+| `docs/` | The illustration above and the script that draws it |
 
 ## Quick start
 
@@ -231,6 +245,58 @@ If the file is missing, you get a warning email instead: the tablet did not repo
 
 </details>
 
+## Snippets
+
+Everyday commands, run in Termux on the tablet.
+
+```sh
+# What is it doing right now?
+tail -f ~/tapo/tapo.log
+
+# Today's activity at a glance
+grep "^$(date +%F)" ~/tapo/tapo.log | grep -cE 'MOVIMIENTO'      # triggers
+grep "^$(date +%F)" ~/tapo/tapo.log | grep -c  'subido:'         # uploads
+
+# Is everything alive? (detector + segmenter ffmpeg, newest ring segment)
+pgrep -c ffmpeg; ls -t ~/tapo/ring | head -1
+
+# What is on Drive this month?
+rclone lsl drive-tapo:Camara/$(date +%Y-%m)
+```
+
+```sh
+# Ask the gate about any clip (prints JSON; exit 0 upload, 1 discard, 2 error)
+~/tapo-nvr/gate/run-gate.sh some-clip.mp4; echo "exit=$?"
+
+# Re-check clips that were held because the gate failed, upload the good ones
+for f in ~/tapo/held/*.mp4; do
+  ~/tapo-nvr/gate/run-gate.sh "$f" >/dev/null && rclone move "$f" "drive-tapo:Camara/$(date +%Y-%m)/"
+done
+```
+
+```sh
+# Send today's summary / a heartbeat right now
+set -a; . ~/.tapo_env; set +a
+~/tapo-nvr/termux/send-summary.sh
+~/tapo-nvr/termux/heartbeat.sh
+
+# Restart cleanly (the launcher stops the watcher, ffmpeg and housekeeper with it)
+kill "$(pgrep -f '/.termux/boot/boot-tapo.sh')"
+nohup ~/.termux/boot/boot-tapo.sh >/dev/null 2>&1 &
+```
+
+```sh
+# From a computer: a shell on the tablet over USB, without exposing SSH to the LAN
+# (on the tablet: pkg install openssh; add your key to ~/.ssh/authorized_keys;
+#  put "ListenAddress 127.0.0.1" and "PasswordAuthentication no" in $PREFIX/etc/ssh/sshd_config)
+adb forward tcp:8022 tcp:8022
+ssh -p 8022 localhost
+```
+
+> When you list processes, remember that the ffmpeg command lines contain the RTSP URL
+> **with the camera password**. Mask it before you paste anything:
+> `ps -eo args | grep [f]fmpeg | sed -E 's#rtsp://[^ ]*#rtsp://***#g'`
+
 ## Tests
 
 ```sh
@@ -253,7 +319,9 @@ To run the recorder offline, set `RTSP_LO`/`RTSP_HI` to local files with
 - **`rclone delete` sends files to the Drive trash**, where they still use quota. Use `--drive-use-trash=false`.
 - **ONVIF PullPoint events do not work** on the C520WS firmware. Subscriptions are created, but pulling them is refused. Motion has to come from the video itself.
 
-## License note
+## License
+
+The code in this repository is [MIT](LICENSE).
 
 The YOLO11 weights and the Ultralytics export tooling are **AGPL-3.0**. The model is not
 included here. If you need a permissive stack, swap in an Apache-2.0 detector (for
