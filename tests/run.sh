@@ -280,6 +280,74 @@ test_capture_falls_back_when_segmenter_died_midclip() {
   assert_contains "$(<"$T/ffmpeg.calls")" "-i rtsp://stub/stream1"
 }
 
+# ---------- unit 3: clip gate ----------
+make_gate() { # make_gate EXIT_CODE -> sets GATE_CMD to a script that records its arg
+  cat >"$T/gate.sh" <<GATE
+#!/usr/bin/env bash
+echo "\$1" >> "$T/gate.args"
+exit $1
+GATE
+  chmod +x "$T/gate.sh"; export GATE_CMD="$T/gate.sh"
+}
+
+test_gate_map_code() {
+  local c
+  gate_map_code 0; assert_rc 0 $? "0 -> upload"
+  gate_map_code 1; assert_rc 1 $? "1 -> discard"
+  for c in 2 3 126 127 130 139; do
+    gate_map_code "$c"; assert_rc 2 $? "$c -> hold (fail-safe)"
+  done
+}
+
+test_clip_gate_default_uploads() {
+  setup
+  clip_gate "$CLIPS/x.mp4"; assert_rc 0 $?
+}
+
+test_clip_gate_runs_cmd_with_file_and_maps() {
+  setup
+  make_gate 0; clip_gate "$CLIPS/x.mp4"; assert_rc 0 $? "exit 0"
+  assert_eq "$CLIPS/x.mp4" "$(<"$T/gate.args")" "gate receives the file"
+  make_gate 1; clip_gate "$CLIPS/x.mp4"; assert_rc 1 $? "exit 1"
+  make_gate 7; clip_gate "$CLIPS/x.mp4"; assert_rc 2 $? "other -> hold"
+  GATE_CMD="$T/does-not-exist"; clip_gate "$CLIPS/x.mp4"; assert_rc 2 $? "missing cmd -> hold"
+}
+
+test_capture_gate_pass_uploads() {
+  setup; make_gate 0
+  capture 1700000000 >/dev/null
+  assert_contains "$(<"$T/rclone.calls")" "move $CLIPS/mov_"
+}
+
+test_capture_gate_discard_deletes_and_logs() {
+  setup; make_gate 1
+  capture 1700000000 >/dev/null
+  assert_no_file "$T/rclone.move"
+  [[ ! -f "$T/rclone.calls" ]] || ! rg -q '^move ' "$T/rclone.calls" || fail "discarded clip was uploaded"
+  assert_eq 0 "$(fd -e mp4 . "$CLIPS" "$HELD" | wc -l | tr -d ' ')" "no clip left anywhere"
+  assert_contains "$(<"$T/log")" "descartado por filtro"
+}
+
+test_capture_gate_hold_keeps_in_held_dir() {
+  setup; make_gate 9
+  capture 1700000000 >/dev/null
+  [[ ! -f "$T/rclone.calls" ]] || ! rg -q '^move ' "$T/rclone.calls" || fail "held clip was uploaded"
+  assert_eq 1 "$(fd -e mp4 . "$HELD" | wc -l | tr -d ' ')" "clip kept in held/"
+  assert_eq 0 "$(fd -e mp4 . "$CLIPS" | wc -l | tr -d ' ')" "not left in the upload queue"
+  assert_contains "$(<"$T/log")" "retenido"
+}
+
+test_flush_pending_never_uploads_held() {
+  setup
+  echo x > "$HELD/held.mp4"
+  flush_pending
+  [[ ! -f "$T/rclone.calls" ]] || fail "flush touched rclone with only held clips"
+  echo y > "$CLIPS/pending.mp4"
+  flush_pending
+  assert_contains "$(<"$T/rclone.calls")" "move $CLIPS "
+  [[ "$(<"$T/rclone.calls")" != *"$HELD"* ]] || fail "held dir referenced"
+}
+
 # ---------- driver ----------
 main_tests() {
   local filter=${1:-} pass=0 failn=0 t out

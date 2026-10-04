@@ -257,6 +257,37 @@ build_clip_from_ring() {
   return $rc
 }
 
+# --- clip gate (extension point) --------------------------------------------
+# gate_map_code RC: 0 = upload, 1 = discard, anything else = hold (fail-safe:
+# a crashing detector never deletes and never uploads).
+gate_map_code() {
+  case $1 in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# clip_gate FILE: 0 = upload, 1 = discard, 2 = hold locally.
+# With GATE_CMD set, runs "$GATE_CMD" FILE (e.g. a person/vehicle detector).
+clip_gate() {
+  [[ -n "${GATE_CMD:-}" ]] || return 0
+  "$GATE_CMD" "$1" </dev/null >>"${LOG:-/dev/null}" 2>&1
+  gate_map_code $?
+}
+
+# deliver_clip FILE YYYY-MM: gate, then upload / discard / hold.
+deliver_clip() {
+  local file=$1 month=$2 rc
+  clip_gate "$file"; rc=$?
+  case $rc in
+    0) upload_clip "$file" "$month" ;;
+    1) rm -f "$file"; log "descartado por filtro: ${file##*/}" ;;
+    *) mkdir -p "$HELD"; mv "$file" "$HELD/"
+       log "retenido localmente (filtro sin veredicto): ${file##*/}" ;;
+  esac
+}
+
 # capture T: runs in the background, T = epoch seconds of the trigger.
 capture() {
   local t=${1:-$(date +%s)} ts month name
@@ -269,7 +300,7 @@ capture() {
     rm -f "$name"
     record_direct "$name" || { log "ERROR grabando — descarto"; rm -f "$name"; purge_drive; return; }
   fi
-  upload_clip "$name" "$month"
+  deliver_clip "$name" "$month"
   purge_drive
 }
 
@@ -315,12 +346,13 @@ detector_loop() {
 # --- process management -----------------------------------------------------
 CHILD_PIDS=()
 
+# kill_tree PID: stop the supervisor first (so it cannot respawn), then
+# everything that was running under it.
 kill_tree() {
-  local c
-  if command -v pgrep >/dev/null; then
-    for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
-  fi
+  local c kids=""
+  command -v pgrep >/dev/null && kids=$(pgrep -P "$1" 2>/dev/null)
   kill "$1" 2>/dev/null
+  for c in $kids; do kill_tree "$c"; done
 }
 
 cleanup() {
