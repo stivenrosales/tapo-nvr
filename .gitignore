@@ -1,0 +1,6 @@
+.tapo_env
+*.env
+clips/
+*.mp4
+*.ts
+*.log
