@@ -8,6 +8,9 @@
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT/tapo-watch.sh"
+source "$ROOT/termux/heartbeat.sh"
+source "$ROOT/termux/send-summary.sh"
+source "$ROOT/termux/housekeeper.sh"
 
 # ---------- helpers ----------
 fail() { echo "  FAIL: $*"; exit 1; }
@@ -359,6 +362,314 @@ test_flush_pending_never_uploads_held() {
   flush_pending
   assert_contains "$(<"$T/rclone.calls")" "move $CLIPS "
   [[ "$(<"$T/rclone.calls")" != *"$HELD"* ]] || fail "held dir referenced"
+}
+
+# ---------- unit 4: heartbeat ----------
+NOW=2000000000
+set_mtime() { # set_mtime FILE EPOCH
+  touch -d "@$2" "$1" 2>/dev/null || touch -t "$(date -r "$2" +%Y%m%d%H%M.%S)" "$1"
+}
+
+make_curl() { # records args and stdin-less body; STUB_CURL_FAIL makes it fail
+  cat >"$T/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/curl.calls"
+[[ -n "${STUB_CURL_FAIL:-}" ]] && { echo "curl: (6) boom $*" >&2; exit 6; }
+exit 0
+STUB
+  chmod +x "$T/bin/curl"
+}
+
+hb_setup() {
+  setup; make_curl
+  unset STUB_CURL_FAIL HC_URL
+  export NOW_EPOCH=$NOW
+  hb_defaults
+}
+
+test_hb_no_hc_url_does_nothing() {
+  hb_setup
+  heartbeat_run; assert_rc 0 $?
+  assert_no_file "$T/curl.calls"
+}
+
+test_hb_healthy_pings_ok_url() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"
+  touch "$RING/seg_1.ts"; set_mtime "$RING/seg_1.ts" $((NOW - 10))
+  hb_detector_running() { return 0; }
+  echo x > "$CLIPS/a.mp4"; echo x > "$HELD/b.mp4"; echo x > "$HELD/c.mp4"
+  heartbeat_run; assert_rc 0 $?
+  local call; call=$(<"$T/curl.calls")
+  assert_contains "$call" "-fsS" ; assert_contains "$call" "-m 10"; assert_contains "$call" "--retry 3"
+  assert_contains "$call" "https://hc.example/ping/abc"
+  [[ "$call" != *"/fail"* ]] || fail "healthy ping went to /fail"
+  assert_contains "$call" "seg_age=10s"
+  assert_contains "$call" "clips=1"
+  assert_contains "$call" "held=2"
+  assert_contains "$call" "disk_free="
+}
+
+test_hb_trailing_slash_in_url_is_handled() {
+  hb_setup; HC_URL="https://hc.example/ping/abc/"
+  hb_detector_running() { return 1; }
+  heartbeat_run
+  assert_contains "$(<"$T/curl.calls")" "https://hc.example/ping/abc/fail"
+  [[ "$(<"$T/curl.calls")" != *"//fail"* ]] || fail "double slash"
+}
+
+test_hb_stale_segment_is_unhealthy() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"
+  touch "$RING/seg_1.ts" "$RING/seg_2.ts"
+  set_mtime "$RING/seg_1.ts" $((NOW - 500)); set_mtime "$RING/seg_2.ts" $((NOW - 61))
+  hb_detector_running() { return 0; }
+  heartbeat_run
+  assert_contains "$(<"$T/curl.calls")" "https://hc.example/ping/abc/fail"
+  assert_contains "$(<"$T/curl.calls")" "segment"
+}
+
+test_hb_newest_segment_counts_not_oldest() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"
+  touch "$RING/seg_1.ts" "$RING/seg_2.ts"
+  set_mtime "$RING/seg_1.ts" $((NOW - 500)); set_mtime "$RING/seg_2.ts" $((NOW - 5))
+  hb_detector_running() { return 0; }
+  heartbeat_run
+  [[ "$(<"$T/curl.calls")" != *"/fail"* ]] || fail "fresh newest segment must be healthy"
+}
+
+test_hb_max_seg_age_is_configurable() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"; HB_MAX_SEG_AGE=600
+  touch "$RING/seg_1.ts"; set_mtime "$RING/seg_1.ts" $((NOW - 500))
+  hb_detector_running() { return 0; }
+  heartbeat_run
+  [[ "$(<"$T/curl.calls")" != *"/fail"* ]] || fail "within custom max age"
+}
+
+test_hb_empty_ring_is_unhealthy() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"
+  hb_detector_running() { return 0; }
+  heartbeat_run
+  assert_contains "$(<"$T/curl.calls")" "/fail"
+}
+
+test_hb_detector_down_is_unhealthy() {
+  hb_setup; HC_URL="https://hc.example/ping/abc"
+  touch "$RING/seg_1.ts"; set_mtime "$RING/seg_1.ts" $((NOW - 1))
+  hb_detector_running() { return 1; }
+  heartbeat_run
+  assert_contains "$(<"$T/curl.calls")" "/fail"
+  assert_contains "$(<"$T/curl.calls")" "detector"
+}
+
+test_hb_default_matcher_matches_watcher_detector_cmdline() {
+  # the real matcher must be derived from what detector_cmd_args runs
+  hb_setup; SCENE=0.005
+  local pat; pat=$(hb_detector_pattern)
+  detector_cmd_args | tr '\n' ' ' | rg -q -- "$pat" || fail "pattern [$pat] does not match detector cmdline"
+  echo "ffmpeg -i x -f segment seg_%s.ts" | rg -q -- "$pat" && fail "pattern matches the segmenter"
+  return 0
+}
+
+test_hb_network_failure_never_crashes_and_never_leaks_url() {
+  hb_setup; HC_URL="https://hc.example/ping/SECRET"; export STUB_CURL_FAIL=1
+  touch "$RING/seg_1.ts"; set_mtime "$RING/seg_1.ts" $((NOW - 1))
+  hb_detector_running() { return 0; }
+  LOG="$T/tapo.log"
+  local out; out=$(heartbeat_run 2>&1); local rc=$?
+  assert_rc 0 $rc "heartbeat must not fail the caller"
+  [[ "$out" != *SECRET* ]] || fail "URL leaked to stdout/stderr"
+  [[ ! -f "$LOG" || "$(<"$LOG")" != *SECRET* ]] || fail "URL leaked to log"
+  assert_contains "$(<"$LOG")" "heartbeat"
+}
+
+# ---------- unit 5: send-summary ----------
+sm_setup() {
+  setup; unset SUMMARY_END
+  sm_defaults
+  LOG="$T/work/tapo.log"
+  cp "$ROOT/tests/fixtures/tapo.log" "$LOG"
+  export SUMMARY_END="2026-10-04 20:55:00"
+}
+
+test_summary_writes_file_and_uploads() {
+  sm_setup
+  send_summary; assert_rc 0 $? "send_summary"
+  assert_file "$WORKDIR/summaries/2026-10-04.json"
+  assert_contains "$(<"$WORKDIR/summaries/2026-10-04.json")" '"uploaded": 3'
+  assert_eq "copyto $WORKDIR/summaries/2026-10-04.json drive-tapo:Camara/resumenes/2026-10-04.json" \
+    "$(<"$T/rclone.calls")"
+  assert_contains "$(<"$LOG")" "resumen diario: subido 2026-10-04.json"
+}
+
+test_summary_upload_failure_logs_and_returns_nonzero() {
+  sm_setup; export STUB_RCLONE_FAIL=1
+  send_summary; assert_rc 1 $? "rclone failure"
+  assert_file "$WORKDIR/summaries/2026-10-04.json"
+  assert_contains "$(<"$LOG")" "resumen diario: ERROR"
+}
+
+test_summary_generator_failure_logs_and_returns_nonzero() {
+  sm_setup; SUMMARY_PY="$T/does-not-exist.py"
+  send_summary; assert_rc 1 $? "generator failure"
+  [[ ! -f "$T/rclone.calls" ]] || fail "must not upload without a summary"
+  assert_contains "$(<"$LOG")" "resumen diario: ERROR"
+}
+
+test_summary_remote_from_env() {
+  sm_setup; REMOTE="other:Cam"
+  send_summary
+  assert_contains "$(<"$T/rclone.calls")" "other:Cam/resumenes/2026-10-04.json"
+}
+
+test_summary_keeps_30_local_files() {
+  sm_setup
+  local d; mkdir -p "$WORKDIR/summaries"
+  for d in $(seq -w 1 40); do echo '{}' > "$WORKDIR/summaries/2026-09-$d.json"; done
+  # 2026-09-31 does not exist but the names just sort; 40 old + today = 41
+  send_summary
+  assert_eq 30 "$(fd -e json . "$WORKDIR/summaries" | wc -l | tr -d ' ')" "files kept"
+  assert_file "$WORKDIR/summaries/2026-10-04.json"
+  assert_no_file "$WORKDIR/summaries/2026-09-01.json"
+  assert_file "$WORKDIR/summaries/2026-09-40.json"
+}
+
+# ---------- unit 6: housekeeper ----------
+hk_setup() {
+  setup
+  unset NOW_EPOCH
+  export TZ=America/Lima
+  hk_defaults
+  HEARTBEAT_CMD="$T/hb.sh"; SUMMARY_CMD="$T/sum.sh"
+  printf '#!/usr/bin/env bash\necho hb >> "%s/hb.calls"\n' "$T" > "$T/hb.sh"
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\necho sum >> "%s/sum.calls"\nexit ${STUB_SUM_RC:-0}\n' "$T" > "$T/sum.sh"
+  chmod +x "$T/hb.sh" "$T/sum.sh"
+  HB_EVERY=300; SUMMARY_AT=20:55
+  STAMP_SUMMARY="$T/work/.last_summary"
+  mkdir -p "$T/work"
+}
+calls() { [[ -f "$T/$1.calls" ]] && wc -l <"$T/$1.calls" | tr -d ' ' || echo 0; }
+# epoch of a Lima wall-clock time: Lima is UTC-5, no DST
+lima() { # lima "YYYY-MM-DD HH:MM" -> epoch
+  local d=${1% *} t=${1#* }
+  TZ=UTC date -d "$d $t:00 UTC" +%s 2>/dev/null \
+    || TZ=UTC date -j -f "%Y-%m-%d %H:%M:%S" "$d $t:00" +%s | awk '{print $1}'
+}
+lima_epoch() { echo $(( $(lima "$1") + 5 * 3600 )); }
+
+test_hk_heartbeat_runs_every_hb_every() {
+  hk_setup
+  local t0; t0=$(lima_epoch "2026-10-04 10:00")
+  hk_init "$t0"
+  hk_tick "$((t0 + 60))";  assert_eq 0 "$(calls hb)" "not yet (boot grace)"
+  hk_tick "$((t0 + 299))"; assert_eq 0 "$(calls hb)"
+  hk_tick "$((t0 + 300))"; assert_eq 1 "$(calls hb)" "after HB_EVERY"
+  hk_tick "$((t0 + 360))"; assert_eq 1 "$(calls hb)"
+  hk_tick "$((t0 + 600))"; assert_eq 2 "$(calls hb)"
+}
+
+test_hk_summary_not_before_summary_at() {
+  hk_setup
+  hk_init "$(lima_epoch "2026-10-04 10:00")"
+  hk_tick "$(lima_epoch "2026-10-04 20:54")"
+  assert_eq 0 "$(calls sum)"
+}
+
+test_hk_summary_sent_once_per_day() {
+  hk_setup
+  hk_init "$(lima_epoch "2026-10-04 20:50")"
+  hk_tick "$(lima_epoch "2026-10-04 20:55")"; assert_eq 1 "$(calls sum)"
+  assert_eq "2026-10-04" "$(<"$STAMP_SUMMARY")"
+  hk_tick "$(lima_epoch "2026-10-04 20:56")"; assert_eq 1 "$(calls sum)" "same day"
+  hk_tick "$(lima_epoch "2026-10-04 23:59")"; assert_eq 1 "$(calls sum)" "same day, late"
+  hk_tick "$(lima_epoch "2026-10-05 20:55")"; assert_eq 2 "$(calls sum)" "next day"
+}
+
+test_hk_summary_catches_up_after_late_boot() {
+  hk_setup
+  hk_init "$(lima_epoch "2026-10-04 22:10")"   # tablet rebooted after 20:55
+  hk_tick "$(lima_epoch "2026-10-04 22:11")"
+  assert_eq 1 "$(calls sum)"
+}
+
+test_hk_summary_after_midnight_waits_for_summary_at() {
+  hk_setup
+  echo 2026-10-04 > "$STAMP_SUMMARY"
+  hk_init "$(lima_epoch "2026-10-05 00:30")"
+  hk_tick "$(lima_epoch "2026-10-05 00:31")"
+  assert_eq 0 "$(calls sum)" "00:31 < 20:55: not due yet"
+}
+
+test_hk_summary_failure_keeps_stamp_unset_and_throttles_retry() {
+  hk_setup; STUB_SUM_RC=1; export STUB_SUM_RC; SUMMARY_RETRY=900
+  local t0; t0=$(lima_epoch "2026-10-04 20:55")
+  hk_init "$t0"
+  hk_tick "$t0"; assert_eq 1 "$(calls sum)"
+  assert_no_file "$STAMP_SUMMARY"
+  hk_tick "$((t0 + 60))"; assert_eq 1 "$(calls sum)" "throttled"
+  STUB_SUM_RC=0
+  hk_tick "$((t0 + 900))"; assert_eq 2 "$(calls sum)" "retried"
+  assert_file "$STAMP_SUMMARY"
+}
+
+test_hk_loads_env_and_exports_it() {
+  hk_setup
+  printf 'HC_URL=https://hc.example/x\nREMOTE=r:Cam\nSUMMARY_AT=21:30\n' > "$T/env"
+  TAPO_ENV="$T/env"
+  hk_load_env
+  assert_eq "https://hc.example/x" "$(bash -c 'echo $HC_URL')" "HC_URL exported to children"
+  assert_eq "r:Cam" "$(bash -c 'echo $REMOTE')"
+  assert_eq "21:30" "$SUMMARY_AT"
+}
+
+test_hk_missing_env_is_not_fatal() {
+  hk_setup; TAPO_ENV="$T/nope"
+  hk_load_env; assert_rc 0 $?
+}
+
+test_hk_now_honours_now_epoch() {
+  hk_setup
+  NOW_EPOCH=12345 hk_now; assert_eq 12345 "$REPLY"
+}
+
+# ---------- unit 7: boot launcher supervision ----------
+boot_setup() {
+  setup
+  export HOME="$T/home"; mkdir -p "$HOME/tapo" "$T/bin"
+  local c
+  for c in termux-wake-lock sshd; do printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/$c"; done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/flock"   # flock is not on macOS
+  chmod +x "$T/bin/"*
+  printf '#!/usr/bin/env bash\necho $$ >> "%s/app.pids"\nexec sleep 30\n' "$T" > "$T/app.sh"
+  printf '#!/usr/bin/env bash\necho $$ >> "%s/hk.pids"\nexec sleep 30\n' "$T" > "$T/hk.sh"
+  chmod +x "$T/app.sh" "$T/hk.sh"
+  export APP="$T/app.sh" HK="$T/hk.sh" RESTART_DELAY=0
+}
+pid_count() { [[ -f "$1" ]] && wc -l <"$1" | tr -d ' ' || echo 0; }
+alive_any() { local p; while read -r p; do kill -0 "$p" 2>/dev/null && return 0; done <"$1"; return 1; }
+
+test_boot_starts_app_and_housekeeper_and_restarts_housekeeper() {
+  boot_setup
+  "$BASH" "$ROOT/termux/boot-tapo.sh" >/dev/null 2>&1 & local boot=$!
+  sleep 1
+  assert_eq 1 "$(pid_count "$T/app.pids")" "app started"
+  assert_eq 1 "$(pid_count "$T/hk.pids")" "housekeeper started"
+  kill "$(tail -1 "$T/hk.pids")"; sleep 1
+  assert_eq 2 "$(pid_count "$T/hk.pids")" "housekeeper restarted after dying"
+  kill "$boot"; wait "$boot" 2>/dev/null
+  sleep 0.5
+  ! alive_any "$T/hk.pids" || { pkill -f "sleep 30"; fail "housekeeper survived the launcher"; }
+}
+
+test_boot_kills_housekeeper_on_term_while_app_runs() {
+  boot_setup
+  "$BASH" "$ROOT/termux/boot-tapo.sh" >/dev/null 2>&1 & local boot=$!
+  sleep 1
+  kill -TERM "$boot"; wait "$boot" 2>/dev/null
+  sleep 0.5
+  local bad=""
+  alive_any "$T/hk.pids" && bad="housekeeper"
+  alive_any "$T/app.pids" && bad="$bad app"
+  [[ -z "$bad" ]] || { pkill -f "sleep 30"; fail "still alive after TERM:$bad"; }
 }
 
 # ---------- driver ----------

@@ -30,3 +30,10 @@ CAM_PASS=change-me
 # Gate tunables (see README): GATE_MODEL GATE_FRAMES=8 GATE_THREADS=4
 #   GATE_CLASSES=person,bicycle,car,motorcycle,bus,truck GATE_CONF=0.4
 #   GATE_MOTION_FRAC=0.15 GATE_DIFF_THRESH=25
+
+# --- Monitoring (termux/housekeeper.sh; see README) ---
+# healthchecks.io ping URL (secret: keep it only in this file). Unset = no heartbeat.
+#HC_URL=https://hc-ping.com/your-check-uuid
+#HB_MAX_SEG_AGE=60   # newest ring segment must be younger than this (s) to be "healthy"
+#HB_EVERY=300        # heartbeat period (s); match the check's Period in healthchecks.io
+#SUMMARY_AT=20:55    # local time from which the daily summary is sent (once per day)

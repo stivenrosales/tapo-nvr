@@ -150,12 +150,65 @@ restrictions*. On Android 12/13 run from a computer:
 (on 12L/13 `device_config put activity_manager max_phantom_processes 2147483647`
 is the alternative).
 
+## Monitoring: heartbeat and daily summary
+
+`termux/boot-tapo.sh` also supervises `termux/housekeeper.sh`, a one-minute loop
+that reads `~/.tapo_env` and runs two jobs.
+
+### Heartbeat (healthchecks.io dead-man's switch)
+
+Set `HC_URL` in `~/.tapo_env` (never commit it; unset = heartbeat disabled).
+Every `HB_EVERY` seconds (default 300) `termux/heartbeat.sh` decides health:
+
+- the newest `ring/seg_*.ts` is younger than `HB_MAX_SEG_AGE` seconds (default 60), **and**
+- the detector ffmpeg process is running.
+
+Healthy: `curl "$HC_URL"` with a body like `seg_age=4s clips=0 held=1 disk_free=12.3G`.
+Unhealthy: `curl "$HC_URL/fail"` with the reason in the body. If the tablet dies
+or loses the network no ping arrives at all, and healthchecks.io alerts on the
+missing ping. In healthchecks.io set **Period 5 minutes, Grace 15 minutes**.
+Failures are logged to `tapo.log` (`heartbeat: ...`), never the URL, and never
+break the housekeeper. The first ping comes `HB_EVERY` seconds after boot, once
+the ring has had time to fill.
+
+### Daily summary
+
+From `SUMMARY_AT` (default `20:55`, local time) the housekeeper runs
+`termux/send-summary.sh` once per day (stamp: `~/tapo/.last_summary`; a tablet
+that was off at that time sends it as soon as it is back; failed attempts are
+retried every 15 min). It runs `termux/daily-summary.py` over the last 24 h of
+`tapo.log`, writes `~/tapo/summaries/YYYY-MM-DD.json` (30 kept) and uploads it with
+`rclone copyto` to `$REMOTE/resumenes/YYYY-MM-DD.json`. A Google Apps Script on
+the Drive side turns it into an email.
+
+Contract (times are America/Lima, `-05:00`; window = `[end-24h, end)`):
+
+```json
+{"date":"2026-10-04","window_start":"2026-10-03T20:55:00-05:00","window_end":"2026-10-04T20:55:00-05:00",
+ "events":5,"uploaded":3,"discarded":1,"held":1,"gate_errors":1,"restarts":1,
+ "incidents":[{"time":"02:00","msg":"monitor cayo (red o camara) — reintento en 15s"}],
+ "incidents_total":3,
+ "clips":[{"time":"21:10","file":"mov_2026-10-03_21-10-05.mp4","folder":"2026-10","size":"6.3M",
+           "labels":[{"class":"person","conf":0.842},{"class":"car","conf":0.7}]}]}
+```
+
+- `date` is the local date of `window_end`. `events` counts `MOVIMIENTO` lines.
+- `clips` = uploaded clips only, chronological; `folder` is the Drive month
+  folder (`YYYY-MM`); `labels` = gate detections deduped by class (max conf),
+  sorted by conf descending (empty if the gate was off).
+- `incidents` = monitor/segmenter restarts and `ERROR` lines, capped at 20;
+  `incidents_total` is the uncapped count (an additive field).
+- `restarts` = number of `vigilancia activa` lines (watcher starts).
+- Garbage lines (python warnings, ffmpeg noise, old entries) are ignored.
+
+By hand: `termux/daily-summary.py ~/tapo/tapo.log --out /tmp/s.json [--end "2026-10-04 20:55"]`.
+
 ## Tests
 
 ```sh
 /opt/homebrew/bin/bash tests/run.sh   # needs bash >= 5 (macOS /bin/bash is 3.2)
-shellcheck tapo-watch.sh tests/*.sh gate/*.sh
-python -m unittest                    # gate; needs numpy (+ onnxruntime for model tests)
+shellcheck tapo-watch.sh tests/*.sh gate/*.sh termux/*.sh
+python -m unittest                    # gate + daily summary; needs numpy (+ onnxruntime for model tests)
 GATE_TEST_CLIP=/path/clip.mp4 python -m unittest   # also runs the real-clip test
 ```
 
