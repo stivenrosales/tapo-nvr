@@ -122,7 +122,7 @@ pkg install python python-numpy python-onnxruntime ffmpeg
 # on a desktop: gate/get-model.sh builds gate/models/yolo11n.onnx; then
 scp gate/models/yolo11n.onnx tablet:tapo-nvr/gate/models/
 cd ~/tapo-nvr/gate/models && sha256sum -c yolo11n.onnx.sha256
-echo 'GATE_CMD=$HOME/tapo-nvr/gate/detect.py' >> ~/.tapo_env
+echo 'GATE_CMD=$HOME/tapo-nvr/gate/run-gate.sh' >> ~/.tapo_env
 ```
 
 Try it by hand: `gate/detect.py clip.mp4; echo $?`.
