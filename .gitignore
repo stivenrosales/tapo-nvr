@@ -4,3 +4,5 @@ clips/
 *.mp4
 *.ts
 *.log
+gate/models/*.onnx
+__pycache__/

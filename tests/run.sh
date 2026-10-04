@@ -313,6 +313,19 @@ test_clip_gate_runs_cmd_with_file_and_maps() {
   GATE_CMD="$T/does-not-exist"; clip_gate "$CLIPS/x.mp4"; assert_rc 2 $? "missing cmd -> hold"
 }
 
+test_clip_gate_appends_gate_stdout_to_log() {
+  setup
+  cat >"$T/gate.sh" <<'GATE'
+#!/usr/bin/env bash
+echo '{"clip":"x.mp4","decision":"discard"}'
+exit 1
+GATE
+  chmod +x "$T/gate.sh"; export GATE_CMD="$T/gate.sh"
+  LOG="$T/watch.log"
+  clip_gate "$CLIPS/x.mp4"; assert_rc 1 $? "exit 1 -> discard"
+  assert_contains "$(<"$T/watch.log")" '"decision":"discard"' "gate JSON line in the log"
+}
+
 test_capture_gate_pass_uploads() {
   setup; make_gate 0
   capture 1700000000 >/dev/null
