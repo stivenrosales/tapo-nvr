@@ -26,4 +26,7 @@ CAM_PASS=change-me
 
 # Extension point: executable called as "$GATE_CMD <clip.mp4>" before upload.
 # exit 0 = upload, 1 = discard, anything else = hold in $WORKDIR/held/
-#GATE_CMD=$HOME/bin/person-filter
+#GATE_CMD=$HOME/tapo-nvr/gate/detect.py   # bundled person/vehicle-in-motion detector
+# Gate tunables (see README): GATE_MODEL GATE_FRAMES=8 GATE_THREADS=4
+#   GATE_CLASSES=person,bicycle,car,motorcycle,bus,truck GATE_CONF=0.4
+#   GATE_MOTION_FRAC=0.15 GATE_DIFF_THRESH=25
