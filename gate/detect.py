@@ -12,10 +12,16 @@ import os
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+# onnxruntime warns at import time on Android/Termux; the platform works fine.
+# Must be registered before onnxruntime is imported (see make_detector).
+warnings.filterwarnings("ignore", message=r"Unsupported platform \(android\)",
+                        category=UserWarning)
 
 SIZE = 640
 POOL = 8  # block size used to drop motion specks

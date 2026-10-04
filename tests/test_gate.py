@@ -220,6 +220,24 @@ class ExitCodeTest(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1])["decision"], "error")
 
 
+class WarningFilterTest(unittest.TestCase):
+    def run_py(self, code):
+        return subprocess.run(
+            [sys.executable, "-W", "error::UserWarning", "-c", code],
+            cwd=ROOT / "gate", capture_output=True, text=True)
+
+    def test_onnxruntime_android_platform_warning_is_silenced(self):
+        r = self.run_py(
+            "import detect, warnings\n"
+            "warnings.warn('Unsupported platform (android). ONNX Runtime supports "
+            "Linux, macOS, AIX and Windows platforms, only.', UserWarning)\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_other_warnings_still_surface(self):
+        r = self.run_py("import detect, warnings\nwarnings.warn('something else', UserWarning)\n")
+        self.assertNotEqual(r.returncode, 0)
+
+
 @unittest.skipUnless(MODEL.exists(),
                      "model not installed")
 class IntegrationTest(unittest.TestCase):
