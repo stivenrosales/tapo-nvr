@@ -1,187 +1,219 @@
 # tapo-nvr
 
-Motion-triggered recorder for a TP-Link Tapo C520WS, built to run in Termux on
-an old Android tablet. It watches the camera's low-res stream, records the
-2K stream with a few seconds of **pre-roll** when something moves, uploads the
-clip to Google Drive and purges old ones.
-
-Single script (`tapo-watch.sh`), bash 5, no dependencies beyond
-`ffmpeg`, `rclone`, coreutils and awk.
-
-## Pipeline
+**A tiny, self-hosted NVR for a TP-Link Tapo camera that runs entirely on an Android tablet.**
+It records only what matters (people and vehicles that actually move), keeps a few
+seconds of pre-roll, uploads the clips to Google Drive, and emails you a daily summary.
+No Tapo Care subscription, no server, no cloud AI.
 
 ```
-                 stream2 (640x360)                    scene score, pts_time
- camera ───────────────────────────► detector ffmpeg ─────────────┐
-   │                                                              ▼
-   │ stream1 (2K)                                     hit counter (MIN_HITS in
-   │                                                  WINDOW s of stream time)
-   ▼                                                              │ trigger @ T
- segmenter ffmpeg ─► ring/seg_<epoch>.ts  (pruned > RING_SECS)    │ (+DEBOUNCE)
- (copy video, AAC)            │                                   ▼
-                              └──────────► capture (background): wait T+CLIP,
-                                           concat [T-PREROLL, T+CLIP] -> mp4
-                                                              │
-                                                              ▼
-                                                   clip_gate ($GATE_CMD)
-                                          0 upload │ 1 discard │ other: hold
-                                                   ▼
-                              rclone move -> drive-tapo:Camara/YYYY-MM/
+motion on the street ──► 2K clip with 5 s of pre-roll ──► YOLO: did a person/vehicle move?
+                                                            ├─ yes ─► Google Drive ─► daily email
+                                                            └─ no  ─► deleted on the tablet
 ```
 
-The camera allows two simultaneous RTSP connections: one for the detector, one
-for the segmenter. If the ring is incomplete (segmenter down) the capture falls
-back to a direct recording without pre-roll.
+---
 
-## Install (Termux)
+## Why
+
+Pixel-based motion detection on a camera that faces a street fires all day: shadows,
+lighting changes, the IR switch at dusk, dogs sleeping on the sidewalk, parked cars.
+Uploading all of that buries the two clips a day you actually care about.
+
+`tapo-nvr` keeps cheap pixel motion as the *trigger* and adds an object detector as a
+*gate* before anything leaves the device. A detection only counts if it **overlaps
+motion**, so a dog sleeping in frame or a parked car never passes on its own.
+
+## Features
+
+- **Pre-roll** – a rolling buffer of 2K segments means each clip starts ~5 s *before* the trigger.
+- **Motion-gated object detection** – YOLO11n (ONNX) on 8 frames per clip, ~1.5 s per clip on a Snapdragon 8 Gen 2.
+- **Fail-safe by design** – if the detector crashes, the clip is *held* locally: never uploaded, never deleted.
+- **Unattended** – starts on boot (Termux:Boot), supervises itself, survives camera/Wi-Fi drops and IP changes.
+- **Dead-man's switch** – a [healthchecks.io](https://healthchecks.io) heartbeat emails you if recording stops.
+- **Daily email** – counts, detections and a link to every clip, sent by a Google Apps Script in your own account.
+- **Retention** – clips older than 60 days are purged from Drive (for real, not to the trash).
+- **Tested** – bash and Python test suites, `shellcheck`-clean.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  cam[Tapo C520WS]
+  subgraph tablet[Android tablet · Termux]
+    det[detector ffmpeg<br/>stream2 640x360<br/>scene score]
+    seg[segmenter ffmpeg<br/>stream1 2K<br/>ring buffer]
+    hit[hit counter<br/>MIN_HITS in WINDOW]
+    cap[capture<br/>concat pre-roll + clip]
+    gate{gate<br/>YOLO + motion}
+    hk[housekeeper<br/>heartbeat · summary]
+  end
+  drive[(Google Drive)]
+  hc[healthchecks.io]
+  gas[Apps Script]
+  mail[[your inbox]]
+
+  cam -- RTSP --> det --> hit --> cap
+  cam -- RTSP --> seg --> cap
+  cap --> gate
+  gate -- person / vehicle moving --> drive
+  gate -- nothing --> trash[deleted locally]
+  gate -- error --> held[held locally]
+  hk -- ping every 5 min --> hc -- missed pings --> mail
+  hk -- daily JSON --> drive --> gas --> mail
+```
+
+The camera accepts two simultaneous RTSP connections: one for detection, one for
+the ring buffer. If the ring is incomplete, capture falls back to a direct recording
+without pre-roll.
+
+## Repository layout
+
+| Path | What it is |
+|------|------------|
+| `tapo-watch.sh` | The recorder: detector, segmenter, capture, upload, purge |
+| `gate/detect.py` | Motion-gated YOLO clip gate (stdlib + numpy + onnxruntime + ffmpeg) |
+| `gate/run-gate.sh` | Termux-safe entry point for the gate |
+| `gate/get-model.sh` | How the ONNX model is exported (the model itself is not committed) |
+| `termux/boot-tapo.sh` | Termux:Boot launcher: wake lock, single-instance supervisor |
+| `termux/housekeeper.sh` | Runs the heartbeat and the daily summary |
+| `termux/heartbeat.sh` | healthchecks.io ping, only when the camera is really recording |
+| `termux/daily-summary.py` | Turns the last 24 h of the log into JSON |
+| `apps-script/Code.gs` | Google Apps Script that emails the daily summary |
+| `tests/` | Bash and Python tests |
+
+## Quick start
+
+### 1. Camera
+
+In the Tapo app: camera → Settings → Advanced settings → **Camera account**. This
+enables RTSP at `rtsp://USER:PASS@CAMERA_IP:554/stream1` (2K) and `/stream2` (360p).
+
+### 2. Tablet (Termux)
+
+Install **Termux** and **Termux:Boot** from F-Droid or GitHub (not Play Store), open
+Termux:Boot once, exclude Termux from battery optimization, and keep the tablet plugged in.
 
 ```sh
-pkg install ffmpeg rclone termux-api
-termux-wake-lock
+pkg install ffmpeg rclone python python-numpy python-onnxruntime curl util-linux
+git clone https://github.com/<you>/tapo-nvr ~/tapo-nvr
+cp ~/tapo-nvr/tapo_env.example ~/.tapo_env && chmod 600 ~/.tapo_env   # then edit it
+rclone config                                                          # remote named drive-tapo
 ```
 
-- Install **Termux:Boot** and put a launcher in `~/.termux/boot/` that runs
-  `~/tapo-nvr/tapo-watch.sh`.
-- Disable battery optimization for Termux, Termux:Boot and Termux:API.
-- Keep the tablet plugged in permanently.
-- `rclone config`: create a remote named `drive-tapo` (see gotchas below).
-- `cp tapo_env.example ~/.tapo_env && chmod 600 ~/.tapo_env`, then edit it.
-
-## Config
-
-Credentials and tunables live in `~/.tapo_env` (see `tapo_env.example` for every
-variable and its default). If the camera IP stops answering, the script scans
-the /24 for port 554 and tells you the new `CAM_IP`.
-
-## Tuning
+Build the model on a desktop and copy it over (see `gate/get-model.sh`), then verify it:
 
 ```sh
-./tapo-watch.sh --calibrar 30   # move in front of the camera for 30 s
+cd ~/tapo-nvr/gate/models && sha256sum -c yolo11n.onnx.sha256
 ```
 
-Prints the background-noise median and your motion peak and suggests a `SCENE`
-value. Hit counting uses the frame timestamps (`pts_time`), not wall clock, so a
-backlog of buffered lines can never fake a detection.
+Install the launcher and start it (it also starts on every boot):
 
-## Clip gate (`GATE_CMD`)
+```sh
+mkdir -p ~/.termux/boot && install -m 755 ~/tapo-nvr/termux/boot-tapo.sh ~/.termux/boot/
+~/.termux/boot/boot-tapo.sh &
+```
 
-Between producing the clip and uploading it the script calls
-`clip_gate <file>`. With `GATE_CMD` unset every clip is uploaded. With it set,
-`"$GATE_CMD" <file.mp4>` runs and its exit code decides:
+> **Android 12+:** the "phantom process killer" can silently kill Termux's child
+> processes. On Android 14+ enable *Developer options → Disable child process
+> restrictions*, or from a computer:
+> `adb shell settings put global settings_enable_monitor_phantom_procs false`.
 
-| exit code | action |
+> **After a reboot** Android does not run any app code until the device is unlocked
+> once (file-based encryption). Unlock the tablet after a power cut.
+
+### 3. Monitoring
+
+1. Create a check on [healthchecks.io](https://healthchecks.io) with **Period 5 min, Grace 15 min**
+   and add `HC_URL=<ping url>` to `~/.tapo_env`.
+2. Create a project at [script.google.com](https://script.google.com), paste
+   `apps-script/Code.gs`, run `setup` once and accept the permissions. It schedules the
+   daily email (21:00–22:00 local time) and sends one right away.
+
+## Configuration
+
+Everything lives in `~/.tapo_env`, which is sourced by every script. See
+[`tapo_env.example`](tapo_env.example) for every variable and its default.
+**Never commit that file:** it holds the camera password and the heartbeat URL.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CAM_IP`, `CAM_USER`, `CAM_PASS` | – | Camera address and RTSP account. If the IP changes, the script rescans the /24 for port 554 |
+| `SCENE` | `0.005` | Per-frame scene-change threshold |
+| `MIN_HITS` / `WINDOW` | `4` / `3` | Hits needed within `WINDOW` seconds of *stream time* to trigger |
+| `PREROLL_SECS` / `CLIP_SECS` | `5` / `30` | Seconds before / after the trigger |
+| `DEBOUNCE` | `40` | Minimum seconds between triggers |
+| `RETENTION_DAYS` | `60` | Drive retention |
+| `GATE_CMD` | unset | Gate executable; unset = upload everything |
+| `HC_URL` | unset | healthchecks.io ping URL; unset = no heartbeat |
+| `SUMMARY_AT` | `20:55` | Local time of the daily summary |
+
+Calibrate the motion threshold against your own scene:
+
+```sh
+~/tapo-nvr/tapo-watch.sh --calibrar 30   # walk in front of the camera for 30 s
+```
+
+## The clip gate
+
+Between producing a clip and uploading it, the recorder runs `"$GATE_CMD" clip.mp4`
+and acts on the exit code:
+
+| Exit code | Action |
 |-----------|--------|
-| 0 | upload |
-| 1 | discard (deleted locally, logged "descartado por filtro") |
-| anything else (crash, 127, timeout...) | **hold**: moved to `$WORKDIR/held/`, never uploaded, never deleted |
+| `0` | upload |
+| `1` | discard (deleted locally) |
+| anything else | **hold** in `held/`: never uploaded, never deleted |
 
-Fail-safe by design: a broken detector never loses a clip and never leaks one.
-`flush_pending` only retries `clips/`, never `held/`. This is the plug-in point
-for detectors; the bundled one is described below. Whatever the gate prints on
-stdout/stderr is appended to the watcher log.
+The bundled gate, `gate/detect.py`:
 
-### Bundled gate: `gate/detect.py`
+1. Samples `GATE_FRAMES` frames evenly across the clip, letterboxed to 640x640.
+2. Builds a background as the per-pixel **median** of those frames; motion mask =
+   `|frame − median| > GATE_DIFF_THRESH`. Anything that never moved, such as a sleeping dog, is background.
+3. Runs YOLO11n on every frame (decoding and NMS in plain numpy).
+4. Keeps a detection only if its class is allowed, its confidence ≥ `GATE_CONF`, and
+   the share of moving pixels inside its box ≥ `GATE_MOTION_FRAC`.
 
-Uploads a clip only if a **person or vehicle MOVES** in it. A plain "is there a
-dog/car in the frame" check would pass every clip here (sleeping dogs, parked
-cars), so a detection only counts if it overlaps motion.
-
-1. Pick `GATE_FRAMES` frames evenly across the clip (ffmpeg decodes at 2 fps,
-   downscaled and letterboxed to 640x640, rgb24 on a pipe).
-2. Background = per-pixel median of those frames (grayscale). Motion mask per
-   frame = `|gray - median| > GATE_DIFF_THRESH`, cleaned with 8x8 block pooling
-   (a block needs >= 25% changed pixels).
-3. YOLO11n (ONNX, COCO, raw `[1, 84, 8400]` output) runs on every sampled frame;
-   decoding and NMS are plain numpy.
-4. A detection qualifies if its class is in `GATE_CLASSES`, conf >=
-   `GATE_CONF`, and the share of motion pixels inside its box >=
-   `GATE_MOTION_FRAC`.
-
-Exit codes: `0` a qualifying detection exists (upload), `1` none (discard),
-`2` any error: missing model, ffmpeg failure, fewer than 3 decodable frames,
-bad env value (the watcher holds the clip). One JSON line goes to stdout:
+It prints one JSON line per clip, which ends up in the log:
 
 ```json
-{"clip":"cam_02.mp4","frames":8,"detections":[{"frame":1,"class":"person","conf":0.711,"motion_frac":0.168}],"decision":"upload","elapsed_ms":573}
+{"clip":"mov_2026-10-04_11-51-02.mp4","frames":8,"detections":[{"frame":7,"class":"person","conf":0.842,"motion_frac":0.543}],"decision":"upload","elapsed_ms":1965}
 ```
 
-| variable | default | meaning |
+| Variable | Default | Meaning |
 |----------|---------|---------|
-| `GATE_MODEL` | `gate/models/yolo11n.onnx` | ONNX model path |
-| `GATE_FRAMES` | 8 | frames sampled per clip |
-| `GATE_THREADS` | 4 | onnxruntime intra-op threads |
-| `GATE_CLASSES` | person,bicycle,car,motorcycle,bus,truck | comma-separated COCO names |
-| `GATE_CONF` | 0.4 | min detection confidence |
-| `GATE_MOTION_FRAC` | 0.15 | min motion share inside the box |
-| `GATE_DIFF_THRESH` | 25 | gray-level diff that counts as motion |
+| `GATE_CLASSES` | `person,bicycle,car,motorcycle,bus,truck` | COCO classes that count |
+| `GATE_CONF` | `0.4` | Minimum confidence |
+| `GATE_MOTION_FRAC` | `0.15` | Minimum share of moving pixels inside the box |
+| `GATE_DIFF_THRESH` | `25` | Grey-level difference that counts as motion |
+| `GATE_FRAMES` | `8` | Frames sampled per clip |
+| `GATE_THREADS` | `4` | onnxruntime threads |
 
-Install on Termux (needs only python, numpy, onnxruntime, ffmpeg):
+**Tuning.** Missing real movers? Lower `GATE_CONF` or `GATE_MOTION_FRAC`. A person who
+stands still for more than half the clip becomes part of the median background; raise
+`GATE_FRAMES`. Too many uploads? Camera pans and exposure jumps light up the whole frame,
+so raise `GATE_DIFF_THRESH` or `GATE_MOTION_FRAC`.
 
-```sh
-pkg install python python-numpy python-onnxruntime ffmpeg
-# on a desktop: gate/get-model.sh builds gate/models/yolo11n.onnx; then
-scp gate/models/yolo11n.onnx tablet:tapo-nvr/gate/models/
-cd ~/tapo-nvr/gate/models && sha256sum -c yolo11n.onnx.sha256
-echo 'GATE_CMD=$HOME/tapo-nvr/gate/run-gate.sh' >> ~/.tapo_env
+## Monitoring
+
+**Heartbeat.** Every 5 minutes `heartbeat.sh` checks that the newest ring segment is
+fresh and that the detector is running. If both hold, it pings `HC_URL`; otherwise it
+pings `HC_URL/fail` with the reason. If the tablet itself dies, the pings stop and
+healthchecks.io emails you.
+
+**Daily summary.** At `SUMMARY_AT` the housekeeper turns the last 24 h of `tapo.log`
+into `resumenes/YYYY-MM-DD.json` on Drive. The Apps Script mails it:
+
+```
+📹 Cámara — dom 4 oct · 3 subido(s), 20 descartado(s)
+  eventos 23 · subidos 3 · descartados 20 · retenidos 0 · reinicios 1
+  11:51  person (0.84)  ▶ ver
+  15:20  car (0.71)     ▶ ver
 ```
 
-Try it by hand: `gate/detect.py clip.mp4; echo $?`.
+If the file is missing, you get a warning email instead: the tablet did not report.
 
-Tuning notes:
-- Missed a real mover (exit 1)? Lower `GATE_CONF` (0.3) or `GATE_MOTION_FRAC`
-  (0.08). People who stand still for most of the clip become part of the median
-  background and can be missed; raise `GATE_FRAMES` to 12 for a sharper median.
-- Too many uploads? Camera pans/exposure changes light up the whole frame and
-  make everything "moving"; raise `GATE_DIFF_THRESH` or `GATE_MOTION_FRAC`.
-- Other animals never qualify unless you add them to `GATE_CLASSES`.
-- Cost: about 0.6-1.2 s per 25 s 2K clip on an Apple-silicon Mac; expect a few
-  times that on the tablet (decode of 2560x1440 h264 dominates).
-
-**Licensing:** Ultralytics YOLO weights and tooling are AGPL-3.0. That is fine
-for this private, personal setup. If you ever need a permissive license, use an
-Apache-2.0 detector (e.g. YOLOX or RT-DETR from other projects) exported to the
-same `[1, 84, N]`-style output, or adapt `decode()` to its layout.
-
-**Android 12+ phantom process killer:** the watcher, segmenter, detector ffmpeg
-and the gate are several child processes of Termux, and Android may kill them
-silently. On Android 14+ enable *Developer options > Disable child process
-restrictions*. On Android 12/13 run from a computer:
-`adb shell settings put global settings_enable_monitor_phantom_procs false`
-(on 12L/13 `device_config put activity_manager max_phantom_processes 2147483647`
-is the alternative).
-
-## Monitoring: heartbeat and daily summary
-
-`termux/boot-tapo.sh` also supervises `termux/housekeeper.sh`, a one-minute loop
-that reads `~/.tapo_env` and runs two jobs.
-
-### Heartbeat (healthchecks.io dead-man's switch)
-
-Set `HC_URL` in `~/.tapo_env` (never commit it; unset = heartbeat disabled).
-Every `HB_EVERY` seconds (default 300) `termux/heartbeat.sh` decides health:
-
-- the newest `ring/seg_*.ts` is younger than `HB_MAX_SEG_AGE` seconds (default 60), **and**
-- the detector ffmpeg process is running.
-
-Healthy: `curl "$HC_URL"` with a body like `seg_age=4s clips=0 held=1 disk_free=12.3G`.
-Unhealthy: `curl "$HC_URL/fail"` with the reason in the body. If the tablet dies
-or loses the network no ping arrives at all, and healthchecks.io alerts on the
-missing ping. In healthchecks.io set **Period 5 minutes, Grace 15 minutes**.
-Failures are logged to `tapo.log` (`heartbeat: ...`), never the URL, and never
-break the housekeeper. The first ping comes `HB_EVERY` seconds after boot, once
-the ring has had time to fill.
-
-### Daily summary
-
-From `SUMMARY_AT` (default `20:55`, local time) the housekeeper runs
-`termux/send-summary.sh` once per day (stamp: `~/tapo/.last_summary`; a tablet
-that was off at that time sends it as soon as it is back; failed attempts are
-retried every 15 min). It runs `termux/daily-summary.py` over the last 24 h of
-`tapo.log`, writes `~/tapo/summaries/YYYY-MM-DD.json` (30 kept) and uploads it with
-`rclone copyto` to `$REMOTE/resumenes/YYYY-MM-DD.json`. A Google Apps Script on
-the Drive side turns it into an email.
-
-Contract (times are America/Lima, `-05:00`; window = `[end-24h, end)`):
+<details>
+<summary>Summary JSON contract</summary>
 
 ```json
 {"date":"2026-10-04","window_start":"2026-10-03T20:55:00-05:00","window_end":"2026-10-04T20:55:00-05:00",
@@ -192,38 +224,37 @@ Contract (times are America/Lima, `-05:00`; window = `[end-24h, end)`):
            "labels":[{"class":"person","conf":0.842},{"class":"car","conf":0.7}]}]}
 ```
 
-- `date` is the local date of `window_end`. `events` counts `MOVIMIENTO` lines.
-- `clips` = uploaded clips only, chronological; `folder` is the Drive month
-  folder (`YYYY-MM`); `labels` = gate detections deduped by class (max conf),
-  sorted by conf descending (empty if the gate was off).
-- `incidents` = monitor/segmenter restarts and `ERROR` lines, capped at 20;
-  `incidents_total` is the uncapped count (an additive field).
-- `restarts` = number of `vigilancia activa` lines (watcher starts).
-- Garbage lines (python warnings, ffmpeg noise, old entries) are ignored.
+- `events` counts triggers; `clips` lists uploaded clips only, in chronological order.
+- `labels` are gate detections deduplicated by class (max confidence).
+- `incidents` is capped at 20; `incidents_total` is the real count.
+- Log lines are Spanish (`MOVIMIENTO`, `subido`, `descartado por filtro`, …) and the parser matches them.
 
-By hand: `termux/daily-summary.py ~/tapo/tapo.log --out /tmp/s.json [--end "2026-10-04 20:55"]`.
+</details>
 
 ## Tests
 
 ```sh
-/opt/homebrew/bin/bash tests/run.sh   # needs bash >= 5 (macOS /bin/bash is 3.2)
+bash tests/run.sh                 # bash >= 5 (on macOS: brew install bash)
+python -m unittest                # needs numpy; onnxruntime for the model tests
+GATE_TEST_CLIP=clip.mp4 python -m unittest   # also runs the real-clip test
 shellcheck tapo-watch.sh tests/*.sh gate/*.sh termux/*.sh
-python -m unittest                    # gate + daily summary; needs numpy (+ onnxruntime for model tests)
-GATE_TEST_CLIP=/path/clip.mp4 python -m unittest   # also runs the real-clip test
 ```
 
-For offline runs `RTSP_LO`/`RTSP_HI` can be set to local files together with
-`IN_OPTS="-re -stream_loop -1"`; this skips `~/.tapo_env` and camera discovery.
+To run the recorder offline, set `RTSP_LO`/`RTSP_HI` to local files with
+`IN_OPTS="-re -stream_loop -1"`. That skips `~/.tapo_env` and camera discovery.
 
-## Known gotchas
+## Gotchas learned the hard way
 
-- **Audio is `pcm_alaw`**: MP4 rejects it, so audio is transcoded to AAC
-  (`-c:a aac`); video is always `-c:v copy`.
-- **rclone's shared `client_id` is being retired.** Create your own Google OAuth
-  client, and set the consent screen to **Published** (not *Testing*) or the
-  refresh token dies after 7 days.
-- **`rclone delete` without `--drive-use-trash=false`** moves files to the Drive
-  trash, where they keep consuming quota. The purge uses the flag; do the same
-  in any manual cleanup.
-- The camera's timestamps are not always monotonic (`non monotonically
-  increasing dts` warnings); the segmenter uses `-fflags +genpts` to mitigate.
+- **Audio is G.711 A-law.** MP4 rejects it, so audio is transcoded to AAC and video is always stream-copied.
+- **ffmpeg inside a `while read` loop eats the loop's stdin.** Every ffmpeg call uses `-nostdin`.
+- **A blocking capture inside the read loop self-retriggers.** Buffered detector lines come in a burst afterwards. Capture runs in the background, and hits are counted on `pts_time`, not the wall clock.
+- **Termux:Boot starts processes without termux-exec**, so `#!/usr/bin/env python3` fails with "bad interpreter". Use absolute Termux shebangs, as in `gate/run-gate.sh`.
+- **rclone's shared Google `client_id` is being retired.** Create your own OAuth client and **publish** the consent screen; in *Testing* the refresh token dies after 7 days.
+- **`rclone delete` sends files to the Drive trash**, where they still use quota. Use `--drive-use-trash=false`.
+- **ONVIF PullPoint events do not work** on the C520WS firmware. Subscriptions are created, but pulling them is refused. Motion has to come from the video itself.
+
+## License note
+
+The YOLO11 weights and the Ultralytics export tooling are **AGPL-3.0**. The model is not
+included here. If you need a permissive stack, swap in an Apache-2.0 detector (for
+example YOLOX or RT-DETR) and adapt `decode()` in `gate/detect.py` to its output layout.

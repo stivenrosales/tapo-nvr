@@ -1,5 +1,5 @@
 # Copy to ~/.tapo_env on the tablet (chmod 600). Never commit the real file.
-CAM_IP=192.168.1.206
+CAM_IP=192.168.1.50
 CAM_USER=change-me
 CAM_PASS=change-me
 
