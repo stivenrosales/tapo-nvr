@@ -2,3 +2,28 @@
 CAM_IP=192.168.1.206
 CAM_USER=change-me
 CAM_PASS=change-me
+
+# --- Optional tunables (defaults shown) ---
+# Detection (stream2, low-res)
+#SCENE=0.005        # per-frame scene-score threshold (use ./tapo-watch.sh --calibrar)
+#MIN_HITS=4         # detections required...
+#WINDOW=3           # ...within this many seconds of STREAM time (pts_time)
+#DEBOUNCE=40        # min wall-clock seconds between triggers
+
+# Clip (stream1, 2K)
+#PREROLL_SECS=5     # seconds before the trigger, taken from the ring buffer
+#CLIP_SECS=30       # seconds after the trigger
+
+# Ring buffer
+#SEG_SECS=5         # segment length
+#RING_SECS=120      # segments older than this are pruned (bounds disk usage)
+#RING_WAIT_SECS=20  # max wait for the last segment to close (default SEG_SECS*3+5)
+
+# Storage
+#RETENTION_DAYS=60  # Drive purge horizon
+#REMOTE=drive-tapo:Camara
+#WORKDIR=$HOME/tapo
+
+# Extension point: executable called as "$GATE_CMD <clip.mp4>" before upload.
+# exit 0 = upload, 1 = discard, anything else = hold in $WORKDIR/held/
+#GATE_CMD=$HOME/bin/person-filter
