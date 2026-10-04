@@ -12,6 +12,14 @@ const ROOT_FOLDER = 'Camara';
 const SUMMARY_FOLDER = 'resumenes';
 const SEND_HOUR = 21; // Apps Script fires somewhere within 21:00–22:00.
 const TIME_ZONE = 'America/Lima';
+const DAYS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
+const MONTHS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+
+// Spanish 'dom 4 oct' or, with time, 'dom 4 12:14' (Utilities.formatDate only speaks English).
+function fmt_(date, withTime) {
+  const [dow, day, month, hm] = Utilities.formatDate(date, TIME_ZONE, 'u|d|M|HH:mm').split('|');
+  return DAYS[Number(dow) % 7] + ' ' + day + ' ' + (withTime ? hm : MONTHS[Number(month) - 1]);
+}
 
 function setup() {
   ScriptApp.getProjectTriggers()
@@ -51,15 +59,15 @@ function sendDailySummary() {
 }
 
 function subject_(s) {
-  const day = Utilities.formatDate(new Date(s.window_end), TIME_ZONE, 'EEE d MMM');
+  const day = fmt_(new Date(s.window_end), false);
   const alert = s.incidents && s.incidents.length ? ' · ⚠️ ' + s.incidents.length + ' incidente(s)' : '';
   return '📹 Cámara — ' + day + ' · ' + s.uploaded + ' subido(s), ' + s.discarded + ' descartado(s)' + alert;
 }
 
 function body_(s, root) {
   const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const from = Utilities.formatDate(new Date(s.window_start), TIME_ZONE, 'EEE d HH:mm');
-  const to = Utilities.formatDate(new Date(s.window_end), TIME_ZONE, 'EEE d HH:mm');
+  const from = fmt_(new Date(s.window_start), true);
+  const to = fmt_(new Date(s.window_end), true);
 
   const stat = (label, value) =>
     '<td style="padding:8px 14px;text-align:center"><div style="font-size:22px;font-weight:600">' +
